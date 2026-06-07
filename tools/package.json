@@ -1,0 +1,11 @@
+{
+  "name": "world-wallet-tools",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "gpt5:dry": "node tools/gpt5-analyze.js proofer-output/proofer_output.txt --dry",
+    "gpt5:print": "node tools/gpt5-analyze.js proofer-output/proofer_output.txt --print",
+    "test": "echo \"No tests configured\" && exit 0"
+  }
+}
