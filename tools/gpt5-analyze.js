@@ -4,6 +4,10 @@
 
   OpenAI-compatible chat completions integration with retries and safety guards.
 
+  Added flags:
+    --dry     : do not post comment to GitHub; print the comment body to stdout
+    --print   : print the GPT request payload (for debugging)
+
   Behavior summary:
   - Reads html-proofer CLI output file and determines PR context from GITHUB_EVENT_PATH.
   - If GPT5_API_KEY is missing, posts a fallback PR comment with truncated raw output and instructions.
@@ -19,8 +23,20 @@ const MAX_COMMENT_LENGTH = 60000; // safe margin under GitHub's ~65536 limit
 const MAX_AI_REPLY = 15000;
 const MAX_RAW_REPORT = 20000;
 
+// Simple arg parsing
+const rawArgs = process.argv.slice(2);
+let dryRun = false;
+let printPayload = false;
+let outFileArg = null;
+for (let i = 0; i < rawArgs.length; i++) {
+  const a = rawArgs[i];
+  if (a === '--dry') dryRun = true;
+  else if (a === '--print') printPayload = true;
+  else if (!outFileArg) outFileArg = a;
+}
+
 async function main() {
-  const outFile = process.argv[2] || 'proofer_output.txt';
+  const outFile = outFileArg || 'proofer_output.txt';
   let prooferText = '';
   try {
     prooferText = await fs.readFile(outFile, 'utf8');
@@ -31,14 +47,21 @@ async function main() {
 
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) {
-    console.error('GITHUB_EVENT_PATH not set; cannot determine PR context. Skipping comment.');
-    process.exit(0);
+    console.error('GITHUB_EVENT_PATH not set; cannot determine PR context.');
+    if (dryRun) {
+      console.log('(dry) Continuing without posting — will print output instead.');
+    } else {
+      console.error('Skipping comment post. To test locally, set GITHUB_EVENT_PATH or use --dry.');
+      process.exit(0);
+    }
   }
 
   let event = {};
   try {
-    const raw = await fs.readFile(eventPath, 'utf8');
-    event = JSON.parse(raw);
+    if (eventPath) {
+      const raw = await fs.readFile(eventPath, 'utf8');
+      event = JSON.parse(raw);
+    }
   } catch (err) {
     console.error('Failed to parse GITHUB_EVENT_PATH:', err.message);
   }
@@ -47,18 +70,26 @@ async function main() {
   const repoFull = event.repository && event.repository.full_name; // owner/repo
 
   if (!prNumber || !repoFull) {
-    console.error('PR number or repository information not found in event payload. Skipping.');
-    process.exit(0);
+    if (!dryRun) {
+      console.error('PR number or repository information not found in event payload. Skipping.');
+      process.exit(0);
+    }
   }
 
-  const [owner, repo] = repoFull.split('/');
+  const owner = repoFull ? repoFull.split('/')[0] : null;
+  const repo = repoFull ? repoFull.split('/')[1] : null;
 
   const gptKey = process.env.GPT5_API_KEY;
   const endpoint = process.env.GPT5_ENDPOINT || 'https://balmasexy.com/v1/chat/completions';
 
   if (!gptKey) {
-    console.log('GPT5_API_KEY not set — posting raw html-proofer output as PR comment with instructions.');
+    console.log('GPT5_API_KEY not set — will post a fallback comment (or print in dry mode).');
     const body = buildFallbackComment(prooferText);
+    if (dryRun) {
+      console.log('--- DRY RUN: would post fallback comment ---\n');
+      console.log(body);
+      process.exit(0);
+    }
     await postPrComment(owner, repo, prNumber, body);
     process.exit(0);
   }
@@ -67,10 +98,20 @@ async function main() {
     const aiReply = await callGpt5WithRetries(gptKey, endpoint, prooferText, 3);
     const shortAi = aiReply.length > MAX_AI_REPLY ? aiReply.slice(0, MAX_AI_REPLY) + '\n\n[Truncated]' : aiReply;
     const body = buildAiComment(shortAi, prooferText);
+    if (dryRun) {
+      console.log('--- DRY RUN: would post AI comment ---\n');
+      console.log(body);
+      process.exit(0);
+    }
     await postPrComment(owner, repo, prNumber, body);
   } catch (err) {
     console.error('GPT-5 call failed:', err.message || err);
     const body = buildFallbackComment(prooferText, '(GPT-5 call failed — posted raw output)');
+    if (dryRun) {
+      console.log('--- DRY RUN: would post fallback comment due to failure ---\n');
+      console.log(body);
+      process.exit(0);
+    }
     await postPrComment(owner, repo, prNumber, body);
   }
 }
@@ -97,13 +138,11 @@ function escapeForMarkdown(text) {
 
 function enforceCommentLimit(body) {
   if (body.length <= MAX_COMMENT_LENGTH) return body;
-  // Truncate the raw output section if present
   const marker = '<details>';
   const idx = body.indexOf(marker);
   if (idx === -1) return body.slice(0, MAX_COMMENT_LENGTH - 20) + '\n\n[Truncated]';
   const head = body.slice(0, idx);
   const tail = body.slice(idx);
-  // truncate tail
   const allowedTail = MAX_COMMENT_LENGTH - head.length - 20;
   if (allowedTail <= 0) return head.slice(0, MAX_COMMENT_LENGTH - 20) + '\n\n[Truncated]';
   return head + tail.slice(0, allowedTail) + '\n\n[Truncated]';
@@ -144,7 +183,6 @@ async function callGpt5WithRetries(key, endpoint, prooferText, attempts) {
     } catch (err) {
       lastErr = err;
       attempt++;
-      // Retry on network errors or 5xx
       const wait = Math.pow(2, attempt) * 1000; // exponential backoff (2^attempt * 1s)
       console.warn(`GPT-5 call attempt ${attempt} failed: ${err.message || err}. Retrying in ${wait}ms`);
       await new Promise(r => setTimeout(r, wait));
@@ -167,6 +205,8 @@ async function callGpt5(key, endpoint, prooferText) {
     max_tokens: 800
   };
 
+  if (printPayload) console.log('GPT5 payload:', JSON.stringify(payload, null, 2));
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
@@ -185,12 +225,10 @@ async function callGpt5(key, endpoint, prooferText) {
   if (!res.ok) {
     const txt = await res.text();
     const err = new Error(`GPT-5 API error: ${res.status} ${txt}`);
-    // classify as transient if 5xx
     if (res.status >= 500 && res.status < 600) err.transient = true;
     throw err;
   }
 
-  // Try parse JSON; if it fails, return raw text
   let data;
   try {
     data = await res.json();
@@ -199,17 +237,20 @@ async function callGpt5(key, endpoint, prooferText) {
     return text;
   }
 
-  // OpenAI-like response parsing
   if (data.choices && data.choices[0]) {
     if (data.choices[0].message && data.choices[0].message.content) return data.choices[0].message.content;
     if (data.choices[0].text) return data.choices[0].text;
   }
 
-  // Fallback: stringify response
   return JSON.stringify(data, null, 2);
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+// If run with --dry, skip posting and just print. Otherwise proceed normally.
+(async () => {
+  try {
+    await main();
+  } catch (e) {
+    console.error(e);
+    process.exit(1);
+  }
+})();
