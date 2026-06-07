@@ -2,36 +2,22 @@
 /*
   tools/gpt5-analyze.js
 
-  Updated to use an OpenAI-compatible chat completions API by default.
+  OpenAI-compatible chat completions integration with retries and safety guards.
 
-  Request/Response spec (OpenAI-compatible, B1):
-  - Endpoint (default): https://balmasexy.com/v1/chat/completions
-    (You can override with environment variable GPT5_ENDPOINT)
-  - HTTP method: POST
-  - Auth: Authorization: Bearer <GPT5_API_KEY>
-    (GPT5_API_KEY must be provided in env)
-  - Headers: Content-Type: application/json
-  - Request body example:
-    {
-      "model": "gpt-5",
-      "messages": [ { "role": "system", "content": "..." }, { "role": "user", "content": "..." } ],
-      "max_tokens": 800
-    }
-  - Response example (OpenAI-style):
-    {
-      "choices": [ { "message": { "role": "assistant", "content": "..." } } ],
-      ...
-    }
-
-  Behavior:
-  - If GPT5_API_KEY is not set, posts a fallback PR comment containing the raw html-proofer output and instructions.
-  - If GPT5_API_KEY is set, POSTs the prompt to the GPT5_ENDPOINT and parses the response for choices[0].message.content.
-  - Posts the AI reply as a PR comment on the pull request that triggered the workflow.
-
-  Note: If your provider is OpenAI, you can set GPT5_ENDPOINT to https://api.openai.com/v1/chat/completions and use the same API key.
+  Behavior summary:
+  - Reads html-proofer CLI output file and determines PR context from GITHUB_EVENT_PATH.
+  - If GPT5_API_KEY is missing, posts a fallback PR comment with truncated raw output and instructions.
+  - If GPT5_API_KEY is present, calls GPT5_ENDPOINT (default https://balmasexy.com/v1/chat/completions) using
+    Authorization: Bearer <GPT5_API_KEY> and an OpenAI-style chat payload.
+  - Retries transient network/5xx errors (3 attempts) with exponential backoff.
+  - Applies a per-request timeout (30s). Truncates large AI replies and raw output to avoid GitHub comment limits.
 */
 
 const fs = require('fs').promises;
+
+const MAX_COMMENT_LENGTH = 60000; // safe margin under GitHub's ~65536 limit
+const MAX_AI_REPLY = 15000;
+const MAX_RAW_REPORT = 20000;
 
 async function main() {
   const outFile = process.argv[2] || 'proofer_output.txt';
@@ -78,8 +64,9 @@ async function main() {
   }
 
   try {
-    const aiReply = await callGpt5(gptKey, endpoint, prooferText);
-    const body = buildAiComment(aiReply, prooferText);
+    const aiReply = await callGpt5WithRetries(gptKey, endpoint, prooferText, 3);
+    const shortAi = aiReply.length > MAX_AI_REPLY ? aiReply.slice(0, MAX_AI_REPLY) + '\n\n[Truncated]' : aiReply;
+    const body = buildAiComment(shortAi, prooferText);
     await postPrComment(owner, repo, prNumber, body);
   } catch (err) {
     console.error('GPT-5 call failed:', err.message || err);
@@ -90,18 +77,36 @@ async function main() {
 
 function buildFallbackComment(reportText, headerNote) {
   const header = headerNote || 'html-proofer found the following issues:';
-  const short = reportText.length > 15000 ? reportText.slice(0,15000) + '\n\n[Truncated]' : reportText;
-  return `**html-proofer report**\n\n${header}\n\n<details><summary>Click to expand html-proofer output</summary>\n\n${escapeForMarkdown(short)}\n\n</details>\n\n_You can enable GPT-5 analysis by adding the repository secret ` + "`GPT5_API_KEY`" + ` and (optionally) ` + "`GPT5_ENDPOINT`" + `._`;
+  const short = reportText.length > MAX_RAW_REPORT ? reportText.slice(0,MAX_RAW_REPORT) + '\n\n[Truncated]' : reportText;
+  const safe = escapeForMarkdown(short);
+  const body = `**html-proofer report**\n\n${header}\n\n<details><summary>Click to expand html-proofer output</summary>\n\n${safe}\n\n</details>\n\n_You can enable GPT-5 analysis by adding the repository secret \\`GPT5_API_KEY\\` and (optionally) \\`GPT5_ENDPOINT\\`._`;
+  return enforceCommentLimit(body);
 }
 
 function buildAiComment(aiText, rawReport) {
-  const shortReport = rawReport.length > 8000 ? rawReport.slice(0,8000) + '\n\n[Truncated]' : rawReport;
-  return `**html-proofer + GPT-5 suggested fixes**\n\n${aiText}\n\n---\n\n<details><summary>html-proofer raw output (click to expand)</summary>\n\n${escapeForMarkdown(shortReport)}\n\n</details>`;
+  const shortReport = rawReport.length > MAX_RAW_REPORT ? rawReport.slice(0,MAX_RAW_REPORT) + '\n\n[Truncated]' : rawReport;
+  const safeReport = escapeForMarkdown(shortReport);
+  const body = `**html-proofer + GPT-5 suggested fixes**\n\n${aiText}\n\n---\n\n<details><summary>html-proofer raw output (click to expand)</summary>\n\n${safeReport}\n\n</details>`;
+  return enforceCommentLimit(body);
 }
 
 function escapeForMarkdown(text) {
-  // Basic escaping to avoid breaking the markdown in PR comments
+  // Prevent triple-backtick blocks from breaking the comment and remove CRs
   return text.replace(/```/g, "`\u200B``").replace(/\r/g, '');
+}
+
+function enforceCommentLimit(body) {
+  if (body.length <= MAX_COMMENT_LENGTH) return body;
+  // Truncate the raw output section if present
+  const marker = '<details>';
+  const idx = body.indexOf(marker);
+  if (idx === -1) return body.slice(0, MAX_COMMENT_LENGTH - 20) + '\n\n[Truncated]';
+  const head = body.slice(0, idx);
+  const tail = body.slice(idx);
+  // truncate tail
+  const allowedTail = MAX_COMMENT_LENGTH - head.length - 20;
+  if (allowedTail <= 0) return head.slice(0, MAX_COMMENT_LENGTH - 20) + '\n\n[Truncated]';
+  return head + tail.slice(0, allowedTail) + '\n\n[Truncated]';
 }
 
 async function postPrComment(owner, repo, prNumber, body) {
@@ -128,6 +133,24 @@ async function postPrComment(owner, repo, prNumber, body) {
   } else {
     console.log('Posted PR comment successfully');
   }
+}
+
+async function callGpt5WithRetries(key, endpoint, prooferText, attempts) {
+  let attempt = 0;
+  let lastErr = null;
+  while (attempt < attempts) {
+    try {
+      return await callGpt5(key, endpoint, prooferText);
+    } catch (err) {
+      lastErr = err;
+      attempt++;
+      // Retry on network errors or 5xx
+      const wait = Math.pow(2, attempt) * 1000; // exponential backoff (2^attempt * 1s)
+      console.warn(`GPT-5 call attempt ${attempt} failed: ${err.message || err}. Retrying in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastErr || new Error('GPT-5 unknown failure');
 }
 
 async function callGpt5(key, endpoint, prooferText) {
@@ -161,19 +184,27 @@ async function callGpt5(key, endpoint, prooferText) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`GPT-5 API error: ${res.status} ${txt}`);
+    const err = new Error(`GPT-5 API error: ${res.status} ${txt}`);
+    // classify as transient if 5xx
+    if (res.status >= 500 && res.status < 600) err.transient = true;
+    throw err;
   }
 
-  const data = await res.json();
+  // Try parse JSON; if it fails, return raw text
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    const text = await res.text();
+    return text;
+  }
 
   // OpenAI-like response parsing
-  if (data.choices && data.choices[0] && data.choices[0].message) {
-    return data.choices[0].message.content;
+  if (data.choices && data.choices[0]) {
+    if (data.choices[0].message && data.choices[0].message.content) return data.choices[0].message.content;
+    if (data.choices[0].text) return data.choices[0].text;
   }
-  // Some providers return a slightly different shape
-  if (data.choices && data.choices[0] && data.choices[0].text) {
-    return data.choices[0].text;
-  }
+
   // Fallback: stringify response
   return JSON.stringify(data, null, 2);
 }
