@@ -1,34 +1,37 @@
-# Gradle files
-.gradle/
-build/
+# Generated .gitignore for Ruby + Node
 
-# Local configuration file (sdk path, etc)
-local.properties
+# Bundler / Ruby
+/.bundle
+/vendor/bundle
+/log/
+/tmp/
+*.gem
+.DS_Store
+/.yardoc
+/_yard/
+coverage/
+.ruby-version
 
-# Log/OS Files
-*.log
+# Node
+/node_modules
+/npm-debug.log*
+/yarn-debug.log*
+/yarn-error.log*
+/pnpm-debug.log*
+/dist
+/build
+/.parcel-cache
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
+# Environment
+.env
+.env.local
+.env.*.local
 
-# IntelliJ
-*.iml
+# IDEs
+.vscode/
 .idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
+*.sublime-project
+*.sublime-workspace
 
-# Keystore files
-*.jks
-*.keystore
-
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
-*.hprof
+# Mac
+.DS_Store
